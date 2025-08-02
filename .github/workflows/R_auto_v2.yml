@@ -1,0 +1,21 @@
+name: r-pipeline
+on: workflow_dispatch
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true                 # 你的 data 用 Git LFS 上傳，這行一定要有
+      - uses: r-lib/actions/setup-r@v2
+      - name: Install system libs
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y libcurl4-openssl-dev libssl-dev libxml2-dev
+      - name: Run R script
+        run: Rscript scRNA_OCP_full_pipeline.R --data_dir data --out_dir docs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scRNA_results
+          path: docs
