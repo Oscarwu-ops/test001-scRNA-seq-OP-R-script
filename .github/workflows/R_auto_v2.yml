@@ -4,7 +4,7 @@ on:
 
 jobs:
   run:
-    runs-on: ubuntu-22.04   # ★ 用 22.04 才能吃到 R 的二進位套件，避免漫長編譯
+    runs-on: ubuntu-22.04
 
     steps:
       - name: Checkout (with LFS)
@@ -12,17 +12,49 @@ jobs:
         with:
           lfs: true
 
-      - name: Show repo tree & check data (debug)
+      - name: Show repo tree (before extract)
         run: |
           echo "Top-level files:"; ls -lah
-          echo "Search *_matrix*.mtx.gz:"; find . -type f -name "*_matrix*.mtx.gz" -printf "%p\t%s bytes\n" | head -n 50 || true
 
-      - name: Set up R
+      # ★★ 先把 GSE*_RAW.tar 解到 data/，再遞迴解巢狀壓縮 ★★
+      - name: Extract GEO RAW to data/
+        run: |
+          set -euo pipefail
+          mkdir -p data
+          shopt -s nullglob
+          for f in *.tar *_RAW.tar; do
+            echo "[extract] $f -> data/"
+            tar -xf "$f" -C data
+          done
+
+          # 遞迴解所有巢狀的 tar/tgz/zip，直到沒有新的壓縮檔
+          rounds=0
+          while true; do
+            rounds=$((rounds+1))
+            found=$(find data -type f \( -name "*.tar" -o -name "*.tar.gz" -o -name "*.tgz" -o -name "*.zip" \) | wc -l)
+            echo "[round $rounds] archives to extract: $found"
+            [ "$found" -eq 0 ] && break
+            while IFS= read -r a; do
+              echo "  -> $a"
+              case "$a" in
+                *.zip) unzip -o "$a" -d "$(dirname "$a")" >/dev/null ;;
+                *.tar|*.tar.gz|*.tgz) tar -xf "$a" -C "$(dirname "$a")" ;;
+              esac
+              # 可視需要刪掉原壓縮，節省空間：
+              # rm -f "$a"
+            done < <(find data -type f \( -name "*.tar" -o -name "*.tar.gz" -o -name "*.tgz" -o -name "*.zip" \))
+            [ "$rounds" -ge 5 ] && break   # 保障不會無限迴圈
+          done
+
+          echo "Search *_matrix*.mtx.gz after extract:"
+          find data -type f -name "*_matrix*.mtx.gz" -printf "%p\t%s bytes\n" | head -n 50 || true
+
+      - name: Set up R (binary + cache)
         uses: r-lib/actions/setup-r@v2
         with:
-          use-public-rspm: true     # ★ 用 RSPM 拉 Linux 二進位，搭配 22.04 才有效
+          use-public-rspm: true
 
-      - name: Restore R deps (binary + cache)
+      - name: Restore R deps (main only)
         uses: r-lib/actions/setup-r-dependencies@v2
         with:
           extra-packages: |
@@ -35,16 +67,14 @@ jobs:
             any::matrixStats
             any::optparse
             any::future
-            bioc::clusterProfiler
-            bioc::org.Hs.eg.db
-            bioc::glmGamPoi
+            any::glmGamPoi
 
       - name: Run R script (QUICK mode)
         env:
-          DATA_DIR: .         # 你說資料在倉庫根目錄
+          DATA_DIR: data        # ★ 解到 data/，讓 R 從這裡遞迴找
           OUTPUT_DIR: docs
-          QUICK: "1"          # ★ 快速模式（抽樣）先驗證流程，之後要全量就移除這行
-          STRICT_FAIL: "0"    # 先別因門檻而失敗，拿到成果與 log 再說
+          QUICK: "1"            # 先用抽樣快速驗證
+          STRICT_FAIL: "0"
         run: |
           mkdir -p docs
           Rscript scRNA_OCP_full_pipeline.R \
@@ -61,6 +91,7 @@ jobs:
         with:
           name: scRNA_results
           path: docs
+
 
 
 
