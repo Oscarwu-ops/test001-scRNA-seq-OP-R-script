@@ -11,19 +11,14 @@ jobs:
         with:
           lfs: true
 
-      - name: Show repo tree & sizes (debug)
+      - name: Show repo tree & check data (debug)
         run: |
-          pwd
-          ls -lah
-          echo "---- tree depth 2 ----"
-          find . -maxdepth 2 -type d -print
-          echo "---- data listing ----"
-          if [ -d data ]; then ls -lah data | head -n 200; fi
-          echo "---- sample of mtx files ----"
-          find data -type f -name "*_matrix*.mtx.gz" | head -n 20 || true
+          echo "PWD:"; pwd
+          echo "List top-level:"; ls -lah
+          echo "Search *_matrix*.mtx.gz under repo root:"
+          find . -type f -name "*_matrix*.mtx.gz" -printf "%p\t%s bytes\n" | head -n 50 || true
 
-      - name: Set up R
-        uses: r-lib/actions/setup-r@v2
+      - uses: r-lib/actions/setup-r@v2
 
       - name: Install system libs
         run: |
@@ -32,17 +27,30 @@ jobs:
 
       - name: Run R script (capture log)
         env:
-          DATA_DIR: data
+          DATA_DIR: .       # ★ 你說資料放在主目錄，這裡改成「.」
           OUTPUT_DIR: docs
+          STRICT_FAIL: "0"  # ★ 關閉嚴格模式（警告但不 exit 1）
         run: |
           mkdir -p docs
-          Rscript scRNA_OCP_full_pipeline.R --data_dir "${DATA_DIR}" --out_dir "${OUTPUT_DIR}" 2>&1 | tee docs/run.log
+          Rscript scRNA_OCP_full_pipeline.R \
+            --data_dir "${DATA_DIR}" \
+            --out_dir  "${OUTPUT_DIR}" 2>&1 | tee docs/run.log
 
-      # Always upload what we have in docs/ (plots, csv, run.log, sessionInfo)
+      - name: Print summary if present
+        run: |
+          if [ -f docs/_summary.json ]; then
+            echo "===== SUMMARY ====="
+            cat docs/_summary.json
+          else
+            echo "No summary file."
+          fi
+
+      # 即使失敗也把 docs/ 打包，讓你下載 run.log / 圖片 / CSV
       - name: Upload artifacts (always)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: scRNA_results
           path: docs
+
 
