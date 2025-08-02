@@ -1,97 +1,98 @@
-name: r-pipeline
+name: scRNA-seq OCP pipeline
+
 on:
-  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+    paths:
+      - '**.R'
+      - '.github/workflows/**.yml'
+      - 'GSE*_RAW.tar*'
+      - 'data/**'
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scrna-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  run:
-    runs-on: ubuntu-22.04
+  run-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
 
     steps:
-      - name: Checkout (with LFS)
+      - name: Checkout (with Git LFS)
         uses: actions/checkout@v4
         with:
           lfs: true
 
-      - name: Show repo tree (before extract)
+      - name: Git LFS pull (ensure large files are present)
+        run: git lfs pull
+
+      - name: Show repository tree (top level)
         run: |
-          echo "Top-level files:"; ls -lah
+          pwd
+          ls -lah
 
-      # ★★ 先把 GSE*_RAW.tar 解到 data/，再遞迴解巢狀壓縮 ★★
-      - name: Extract GEO RAW to data/
-        run: |
-          set -euo pipefail
-          mkdir -p data
-          shopt -s nullglob
-          for f in *.tar *_RAW.tar; do
-            echo "[extract] $f -> data/"
-            tar -xf "$f" -C data
-          done
-
-          # 遞迴解所有巢狀的 tar/tgz/zip，直到沒有新的壓縮檔
-          rounds=0
-          while true; do
-            rounds=$((rounds+1))
-            found=$(find data -type f \( -name "*.tar" -o -name "*.tar.gz" -o -name "*.tgz" -o -name "*.zip" \) | wc -l)
-            echo "[round $rounds] archives to extract: $found"
-            [ "$found" -eq 0 ] && break
-            while IFS= read -r a; do
-              echo "  -> $a"
-              case "$a" in
-                *.zip) unzip -o "$a" -d "$(dirname "$a")" >/dev/null ;;
-                *.tar|*.tar.gz|*.tgz) tar -xf "$a" -C "$(dirname "$a")" ;;
-              esac
-              # 可視需要刪掉原壓縮，節省空間：
-              # rm -f "$a"
-            done < <(find data -type f \( -name "*.tar" -o -name "*.tar.gz" -o -name "*.tgz" -o -name "*.zip" \))
-            [ "$rounds" -ge 5 ] && break   # 保障不會無限迴圈
-          done
-
-          echo "Search *_matrix*.mtx.gz after extract:"
-          find data -type f -name "*_matrix*.mtx.gz" -printf "%p\t%s bytes\n" | head -n 50 || true
-
-      - name: Set up R (binary + cache)
+      - name: Set up R
         uses: r-lib/actions/setup-r@v2
         with:
+          r-version: '4.5.1'
           use-public-rspm: true
 
-      - name: Restore R deps (main only)
+      - name: Cache R packages
         uses: r-lib/actions/setup-r-dependencies@v2
         with:
+          cache-version: 1
+          # 不強制預裝所有相依；腳本會自動安裝缺的
           extra-packages: |
+            any::optparse
             any::Seurat
             any::SeuratObject
+            any::matrixStats
+            any::clue
             any::patchwork
             any::readr
             any::dplyr
             any::ggplot2
-            any::matrixStats
-            any::optparse
+            any::ggrepel
             any::future
-            any::glmGamPoi
 
-      - name: Run R script (QUICK mode)
+      - name: Run scRNA pipeline (QUICK confirm → FULL)
         env:
-          DATA_DIR: data        # ★ 解到 data/，讓 R 從這裡遞迴找
+          DATA_DIR: .
           OUTPUT_DIR: docs
-          QUICK: "1"            # 先用抽樣快速驗證
-          STRICT_FAIL: "0"
+          QUICK: "1"               # 1=先快跑確認，通過再全量；0=直接全量
+          MIN_OCP: "100"
+          MIN_OC: "100"
+          STRICT_FAIL: "0"         # 0=記 error.txt 但不中斷；1=遇錯即失敗
+          DO_DOUBLET: "1"          # 開啟雙元細胞檢測（scDblFinder/MAD）
+          DO_HARMONY: "0"          # 1=用 Harmony（需 BATCH_KEY）
+          DO_ANCHOR: "0"           # 1=用 Seurat anchors（需 BATCH_KEY）
+          BATCH_KEY: "donor"       # 依你的 meta 欄位改成 donor/sample/batch
+          DO_PSEUDOBULK: "1"       # 有 donor 時做 pseudobulk DE
+          PSEUDO_MIN_CELLS: "50"
+          DO_ENRICH: "0"           # 全量完成後是否做 GO 富集
+          DO_TRAJECTORY: "0"       # 是否做 Slingshot（較花時間）
         run: |
-          mkdir -p docs
-          Rscript scRNA_OCP_full_pipeline.R \
-            --data_dir "${DATA_DIR}" \
-            --out_dir  "${OUTPUT_DIR}" 2>&1 | tee docs/run.log
+          Rscript scRNA_OCP_full_pipeline.R --data_dir . --out_dir docs
 
-      - name: Print summary if present
+      - name: List outputs
+        if: always()
         run: |
-          test -f docs/_summary.json && (echo "===== SUMMARY ====="; cat docs/_summary.json) || echo "No summary."
+          echo "== docs ==" && ls -lah docs || true
+          echo "== plots ==" && ls -lah docs/plots || true
+          echo "== error log ==" && (test -f docs/_error.txt && cat docs/_error.txt || echo "(no _error.txt)")
 
-      - name: Upload artifacts (always)
+      - name: Upload results as artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: scRNA_results
-          path: docs
-
-
-
-
+          name: scRNA-results-${{ github.run_number }}
+          path: |
+            docs/**
+          if-no-files-found: warn
