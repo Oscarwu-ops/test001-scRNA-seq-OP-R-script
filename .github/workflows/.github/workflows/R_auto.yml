@@ -1,0 +1,38 @@
+name: scRNA-pipeline
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - scRNA_OCP_full_pipeline.R
+      - .github/workflows/R_auto.yml
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+
+      - name: Install Linux libs
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y libcurl4-openssl-dev libssl-dev libxml2-dev
+
+      - name: Run pipeline
+        env:
+          DATA_DIR: data     # 你的 10x 檔案所在資料夾（在 repo 內）
+          OUTPUT_DIR: docs   # 輸出寫到 docs/
+        run: |
+          Rscript scRNA_OCP_full_pipeline.R \
+            --data_dir "${DATA_DIR}" \
+            --out_dir  "${OUTPUT_DIR}"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: scRNA_results
+          path: docs
