@@ -1,128 +1,22 @@
-###############################################################################
-#  scRNA_OCP_full_pipeline.R  --  GitHub Actions friendly version
-#  1. 不需互動、僅寫必要日誌 (message)。
-#  2. 透過命令列或環境變數指定資料根目錄與輸出目錄。
-#  3. 所有結果 (*.png, *.csv) 寫入 <output_dir> (預設 repo/docs)。
-#  4. 若缺套件自動安裝二進位版本 (CRAN)。
-# -----------------------------------------------------------------------------
-#  用法 (本地端)：
-#     Rscript scRNA_OCP_full_pipeline.R --data_dir data/ --out_dir docs/
-#  用法 (GitHub Actions)：
-#     - name: Run scRNA pipeline
-#       run: Rscript scRNA_OCP_full_pipeline.R
-###############################################################################
+name: r-pipeline
+on: workflow_dispatch
 
-## ==================== 0. 參數解析 ==================== ##
-library(optparse)
-opt <- OptionParser()
-opt <- add_option(opt, c("-d", "--data_dir"),  type = "character", default = Sys.getenv("DATA_DIR", "."),
-                  help = "root directory that contains GSE folders [default: %default]")
-opt <- add_option(opt, c("-o", "--out_dir"),   type = "character", default = Sys.getenv("OUTPUT_DIR", "docs"),
-                  help = "output directory [default: %default]")
-args <- parse_args(opt)
-root_dir <- normalizePath(args$data_dir, mustWork = TRUE)
-out_dir  <- normalizePath(args$out_dir,  mustWork = FALSE)
-dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
-plot_dir <- file.path(out_dir, "plots"); dir.create(plot_dir, FALSE, TRUE)
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true                 # ← 你的資料用 LFS 的話，這行一定要有
+      - uses: r-lib/actions/setup-r@v2
+      - name: Install system libs
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y libcurl4-openssl-dev libssl-dev libxml2-dev
+      - name: Run R script
+        run: Rscript scRNA_OCP_full_pipeline.R --data_dir data --out_dir docs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scRNA_results
+          path: docs
 
-## ==================== 1. 套件安裝 & 載入 =============== ##
-cran_pkgs <- c("Seurat", "SeuratObject", "matrixStats", "clue", "patchwork", "readr", "dplyr", "ggplot2", "optparse", "clusterProfiler", "org.Hs.eg.db")
-needs <- cran_pkgs[!nzchar(find.package(cran_pkgs, quiet = TRUE))]
-if (length(needs)) install.packages(needs, repos = "https://cloud.r-project.org", type = "binary")
-
-suppressPackageStartupMessages({
-  library(Seurat)
-  library(matrixStats)
-  library(clue)
-  library(patchwork)
-  library(readr)
-  library(dplyr)
-  library(ggplot2)
-  library(clusterProfiler)
-  library(org.Hs.eg.db)
-})
-
-## -------- RowVar patch for SeuratObject ≥5.1 on Windows ---------- ##
-if (!exists("rowVar", where = asNamespace("SeuratObject"))) {
-  unlockBinding("rowVar", getNamespace("SeuratObject"))
-  assign("rowVar", matrixStats::rowVars, envir = asNamespace("SeuratObject"))
-  lockBinding("rowVar", getNamespace("SeuratObject"))
-}
-
-set.seed(42)
-
-## ==================== 2. 讀取 10x 矩陣 ================= ##
-mat_files <- list.files(root_dir, pattern = "_matrix.*\\.mtx\\.gz$", recursive = TRUE, full.names = TRUE)
-if (length(mat_files) == 0) stop("No _matrix.mtx.gz files found under ", root_dir)
-
-read_one <- function(mtx_fp) {
-  dirp   <- dirname(mtx_fp)
-  prefix <- sub("_matrix.*\\.mtx\\.gz$", "", basename(mtx_fp))
-  bc   <- list.files(dirp, paste0("^", prefix, ".*barcode[s]*.*tsv(\\.gz)?$"), full.names = TRUE)[1]
-  feat <- list.files(dirp, paste0("^", prefix, ".*(features|genes).*tsv(\\.gz)?$"), full.names = TRUE)[1]
-  if (is.na(bc) || is.na(feat)) stop("Missing barcodes/features for ", prefix)
-  CreateSeuratObject(ReadMtx(mtx_fp, cells = bc, features = feat), project = basename(dirname(mtx_fp)))
-}
-obj <- Reduce(function(x,y) merge(x, y), lapply(mat_files, read_one))
-
-## ==================== 3. QC ========================== ##
-obj[["percent.mt"]] <- PercentageFeatureSet(obj, "^MT-")
-obj <- subset(obj, subset = nFeature_RNA > 500 & percent.mt < 20)
-
-## ==================== 4. SCTransform ================= ##
-obj <- SCTransform(obj, vst.flavor = "v2", verbose = FALSE)
-
-## ==================== 5. PCA / UMAP / Clustering ===== ##
-obj <- RunPCA(obj, npcs = 30, verbose = FALSE) |
-       RunUMAP(dims = 1:20)                 |
-       FindNeighbors(dims = 1:20)           |
-       FindClusters(resolution = 0.6)
-
-## 5.1 Save UMAP plot with marker genes
-OCP_pos <- c("CSF1R", "IRF8"); OC_pos <- c("ACP5", "CTSK", "ATP6V0D2")
-p <- (FeaturePlot(obj, OCP_pos, combine = FALSE) %>% wrap_plots()) /
-     (FeaturePlot(obj, OC_pos,  combine = FALSE) %>% wrap_plots())
-file_umap <- file.path(plot_dir, "UMAP_markers.png"); ggsave(file_umap, p, width = 9, height = 6)
-
-## ==================== 6. 技術下采樣 ARI ============== ##
-ari_vec <- replicate(5, {
-  cells_half <- sample(colnames(obj), floor(0.5 * ncol(obj)))
-  obj_half <- subset(obj, cells = cells_half) %>%
-              FindNeighbors(dims = 1:20) %>%
-              FindClusters(resolution = 0.6)
-  adjustedRandIndex(Idents(obj)[cells_half], Idents(obj_half))
-})
-write.csv(data.frame(ARI = ari_vec), file.path(out_dir, "tech_subsample_ARI.csv"), row.names = FALSE)
-
-## ==================== 7. (可選) Leave-One-Donor-Out === ##
-if ("donor" %in% colnames(obj@meta.data)) {
-  donors <- unique(obj$donor)
-  lodo <- sapply(donors, function(d) {
-    train <- subset(obj, subset = donor != d)
-    test  <- subset(obj, subset = donor == d)
-    train <- RunPCA(train, npcs = 30) %>% FindNeighbors(dims = 1:20) %>% FindClusters()
-    anchors <- FindTransferAnchors(train, test, dims = 1:20)
-    test <- MapQuery(anchors, query = test, reference = train, refdata = list(cluster="seurat_clusters"))
-    mean(test$predicted.cluster == test$seurat_clusters)
-  })
-  write.csv(data.frame(donor = names(lodo), acc = lodo), file.path(out_dir, "LODO_accuracy.csv"), row.names = FALSE)
-}
-
-## ==================== 8. DE: OCP vs OC =============== ##
-# 假定手動標記 Idents(obj) = "OCP" / "OC"  (此處示例 cluster 0=OCP, 1=OC)
-obj$short_cluster <- recode(Idents(obj), `0` = "OCP", `1` = "OC")
-Idents(obj) <- "short_cluster"
-if (all(c("OCP", "OC") %in% levels(Idents(obj)))) {
-  de <- FindMarkers(obj, ident.1 = "OCP", ident.2 = "OC", test.use = "wilcox")
-  write.csv(de, file.path(out_dir, "DE_OCP_vs_OC.csv"))
-}
-
-## ==================== 9. GO enrichment =============== ##
-if (exists("de") && nrow(de) > 0) {
-  up <- rownames(de)[de$avg_log2FC > 0.25 & de$p_val_adj < 0.05]
-  entrez <- mapIds(org.Hs.eg.db, up, "ENTREZID", "SYMBOL", multiVals = "first")
-  ego <- enrichGO(entrez, OrgDb = org.Hs.eg.db, keyType="ENTREZID", ont="BP")
-  write.csv(as.data.frame(ego), file.path(out_dir, "GO_up_OCP.csv"), row.names = FALSE)
-}
-
-message("Pipeline finished. Outputs saved to ", out_dir)
