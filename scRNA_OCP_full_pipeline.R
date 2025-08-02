@@ -1,27 +1,18 @@
 ###############################################################################
-#  scRNA_OCP_full_pipeline.R  --  CI-friendly, auto-extract, fast defaults
+#  scRNA_OCP_full_pipeline.R  --  CI-friendly, auto-extract, OCP/OC DEG ready
 #
-#  用法 (GitHub Actions / 本機皆可)：
+#  用法：
 #    Rscript scRNA_OCP_full_pipeline.R --data_dir . --out_dir docs
 #
-#  重要環境變數 (也可改用 CLI 參數)：
-#    DATA_DIR   = "."     # 原始檔案所在根目錄；會遞迴解壓並尋找 *_matrix*.mtx.gz
-#    OUTPUT_DIR = "docs"  # 所有輸出放這裡
-#    QUICK      = "1"     # "1"=快速模式(抽樣≤5000細胞)；"0"=全量
-#    STRICT_FAIL= "0"     # "1"=遇到不合理數據(如細胞太少)直接 exit 1；"0"=只寫 _error.txt
-#    DO_ENRICH  = "0"     # "1"=做 GO 富集 (會安裝 Bioc；建議只在正式產物時開啟)
-#
-#  主要流程：
-#   1) 自動(必要時)把 GSE*_RAW.tar / *.tar.gz / *.zip 解到 data_dir 之下
-#   2) 收集 10x 三件組；讀入並合併
-#   3) 基本 QC（nFeature_RNA、percent.mt）
-#   4) SCTransform（若有 glmGamPoi 則用以加速，否則採預設）
-#   5) PCA → UMAP → 鄰居圖 → 聚類
-#   6) 繪製 OCP/OC markers UMAP、技術下采樣 ARI、(可選) LODO、(可選) DE/GO
-#   7) 寫出 _summary.json、run artifacts（圖、csv、rds、sessionInfo）
+#  環境變數（也可用 CLI 取代）：
+#    DATA_DIR    = "."      # 原始檔案根目錄；會自動遞迴解壓並尋找 *_matrix*.mtx.gz
+#    OUTPUT_DIR  = "docs"   # 所有輸出放這裡（圖、CSV、RDS、log、summary）
+#    QUICK       = "1"      # "1"=抽樣≤5000細胞做快速驗證；"0"=全量
+#    STRICT_FAIL = "0"      # "1"=遇到關鍵錯誤直接 exit 1；"0"=寫 _error.txt 後正常結束
+#    DO_ENRICH   = "0"      # "1"=做 GO 富集（需 Bioconductor；建議正式產物時才開）
 ###############################################################################
 
-## ========== 0. 前置：參數與小工具 ==========
+## ========== 0. 前置：安裝必要 CRAN、讀參數、工具 ==========
 quiet_install <- function(pkgs) {
   need <- pkgs[!sapply(pkgs, function(p) requireNamespace(p, quietly = TRUE))]
   if (length(need)) install.packages(need, repos = "https://cloud.r-project.org")
@@ -53,22 +44,23 @@ logi <- function(...) message(paste0("[", format(Sys.time(), "%H:%M:%S"), "] ", 
 append_file <- function(path, ...) cat(paste0(..., collapse=""), file = path, sep = "", append = TRUE)
 fail_now <- function(msg) {
   append_file(file.path(out_dir, "_error.txt"), msg, "\n")
-  # 另外輸出 sessionInfo 便於診斷
   sink(file.path(out_dir, "sessionInfo.txt")); print(sessionInfo()); sink()
   if (STRICT_FAIL) quit(status = 1, save = "no") else return(invisible(NULL))
 }
 
 set.seed(42)
 
-## ========== 1. 套件 ==========
-# 主流程的 CRAN 套件
-quiet_install(c("Seurat","SeuratObject","matrixStats","clue","patchwork","readr","dplyr","ggplot2","future"))
+## ========== 1. 主流程套件 ==========
+# 只裝 CRAN；Bioc（clusterProfiler/org.Hs.eg.db）僅在 DO_ENRICH=1 時安裝
+quiet_install(c("Seurat","SeuratObject","matrixStats","clue","patchwork",
+                "readr","dplyr","ggplot2","future","ggrepel"))
 suppressPackageStartupMessages({
   library(Seurat); library(SeuratObject); library(matrixStats); library(clue)
-  library(patchwork); library(readr); library(dplyr); library(ggplot2); library(future)
+  library(patchwork); library(readr); library(dplyr); library(ggplot2)
+  library(future); library(ggrepel)
 })
 
-# 多核（GitHub Actions 多半 2 核）
+# 多核（GitHub Actions 多為 2 核）
 plan(multisession, workers = max(1, parallel::detectCores(logical = TRUE) - 0))
 
 ## ========== 2. 找 10x 檔案；必要時自動解壓 ==========
@@ -83,7 +75,6 @@ auto_extract_archives <- function(path_root, max_rounds = 5) {
   rounds <- 0
   repeat {
     rounds <- rounds + 1
-    # 找到所有巢狀壓縮
     z <- list.files(path_root, recursive = TRUE, full.names = TRUE,
                     pattern = "(\\.tar$)|(\\.tar\\.gz$)|(\\.tgz$)|(\\.zip$)")
     if (!length(z) || rounds > max_rounds) break
@@ -93,7 +84,7 @@ auto_extract_archives <- function(path_root, max_rounds = 5) {
       logi("  -> ", a)
       if (ext %in% c("tar","gz","tgz")) utils::untar(a, exdir = dst, tar = "internal")
       else if (ext == "zip") utils::unzip(a, exdir = dst)
-      # 如需節省空間可刪除原壓縮：try(unlink(a), silent = TRUE)
+      # 可選：unlink(a)
     }
   }
 }
@@ -106,19 +97,15 @@ if (length(mat_files) == 0) {
 }
 
 if (length(mat_files) == 0) {
-  # 輸出目錄快照，幫助你在 Actions 上判斷
   append_file(file.path(out_dir, "_error.txt"),
               "No _matrix.mtx.gz under ", root_dir, "\nTop-level files:\n",
               paste0(list.files(root_dir, full.names = TRUE), collapse = "\n"), "\n")
-  if (STRICT_FAIL) quit(status = 1, save = "no") else {
-    # 仍寫出空的 summary 與 sessionInfo 方便你看
-    write_json(list(n_matrices = 0), file.path(out_dir, "_summary.json"), auto_unbox = TRUE, pretty = TRUE)
-    sink(file.path(out_dir, "sessionInfo.txt")); print(sessionInfo()); sink()
-    quit(status = 0, save = "no")
-  }
+  write_json(list(n_matrices = 0), file.path(out_dir, "_summary.json"), auto_unbox = TRUE, pretty = TRUE)
+  sink(file.path(out_dir, "sessionInfo.txt")); print(sessionInfo()); sink()
+  if (STRICT_FAIL) quit(status = 1, save = "no") else quit(status = 0, save = "no")
 }
 
-# 記錄前幾個找到的矩陣
+# 記錄前幾個找到的矩陣路徑
 cat("First few matrices:\n", paste0(utils::head(mat_files, 10), collapse = "\n"), "\n",
     file = file.path(out_dir, "_matrices_found.txt"))
 
@@ -146,7 +133,7 @@ read_one <- function(mtx_fp) {
 logi("Loading matrices into Seurat objects…")
 objs <- lapply(mat_files, read_one)
 objs <- Filter(Negate(is.null), objs)
-if (!length(objs)) fail_now("All matrices failed to pair with barcodes/features; see _error.txt")
+if (!length(objs)) fail_now("All matrices failed pairing with barcodes/features; see _error.txt")
 
 obj  <- if (length(objs) == 1) objs[[1]] else Reduce(function(x,y) merge(x, y), objs)
 
@@ -157,9 +144,9 @@ obj <- subset(obj, subset = nFeature_RNA > 500 & percent.mt < 20)
 logi("QC filter: cells kept ", ncol(obj), "/", n0)
 if (ncol(obj) < 200 && STRICT_FAIL) fail_now(paste0("Too few cells after QC: ", ncol(obj)))
 
-## ========== 5. 快速模式抽樣 (可選) ==========
+## ========== 5. 快速模式抽樣（可選） ==========
 if (QUICK) {
-  keep <- min(5000, ncol(obj))  # 視資料量調整上限
+  keep <- min(5000, ncol(obj))
   if (ncol(obj) > keep) {
     set.seed(42)
     obj <- subset(obj, cells = sample(colnames(obj), keep))
@@ -170,7 +157,7 @@ if (QUICK) {
 }
 
 ## ========== 6. SCTransform + PCA/UMAP/聚類 ==========
-# 若有 glmGamPoi 則使用（更快、省記憶體）；沒有就用預設
+# 若已安裝 Bioc 的 glmGamPoi，則使用（更快、省記憶體）；否則使用預設
 method_sel <- if (requireNamespace("glmGamPoi", quietly = TRUE)) "glmGamPoi" else NULL
 if (is.null(method_sel)) {
   logi("SCTransform without glmGamPoi (install Bioc glmGamPoi to speed up).")
@@ -187,16 +174,151 @@ obj <- RunPCA(obj, npcs = 30, verbose = FALSE) |>
        FindNeighbors(dims = 1:20, verbose = FALSE) |>
        FindClusters(resolution = 0.6, verbose = FALSE)
 
-## ========== 7. 繪圖：OCP / OC markers ==========
+## ========== 7. UMAP（OCP/OC 標註 + 圖上說明）==========
 OCP_pos <- c("CSF1R","IRF8")
 OC_pos  <- c("ACP5","CTSK","ATP6V0D2")
-p <- (FeaturePlot(obj, OCP_pos, combine = FALSE) |> patchwork::wrap_plots()) /
-     (FeaturePlot(obj, OC_pos,  combine = FALSE) |> patchwork::wrap_plots())
-ggsave(file.path(plot_dir, "UMAP_markers.png"), p, width = 9, height = 6, dpi = 300)
 
-## ========== 8. 技術下采樣 ARI (五次) ==========
+DefaultAssay(obj) <- "SCT"
+legend_title <- "標準化表現量 (SCT；低→高)"
+
+fmt_plots <- function(plist, legend_title) {
+  lapply(plist, function(p) {
+    p +
+      labs(color = legend_title) +
+      theme(
+        legend.position = "right",
+        legend.title = element_text(size = 11),
+        legend.text  = element_text(size = 9)
+      )
+  })
+}
+
+p_ocp <- FeaturePlot(
+  obj, OCP_pos, combine = FALSE,
+  cols = c("grey85","firebrick"),
+  min.cutoff = "q05", max.cutoff = "q95"
+)
+p_oc  <- FeaturePlot(
+  obj, OC_pos,  combine = FALSE,
+  cols = c("grey85","steelblue"),
+  min.cutoff = "q05", max.cutoff = "q95"
+)
+
+p_ocp <- fmt_plots(p_ocp, legend_title)
+p_oc  <- fmt_plots(p_oc,  legend_title)
+
+p_umap <- patchwork::wrap_plots(p_ocp, nrow = 1) /
+          patchwork::wrap_plots(p_oc,  nrow = 1)
+
+p_umap <- p_umap + patchwork::plot_annotation(
+  title   = "OCP / OC 標記基因 UMAP",
+  caption = paste(
+    "色軸：該基因在每個細胞的標準化表現量（SCT），由低(灰)到高(色)。",
+    "灰色點：該基因在該細胞幾乎無表現或低於最小截斷（min.cutoff）。"
+  )
+)
+
+ggsave(file.path(plot_dir, "UMAP_markers.png"), p_umap, width = 10, height = 6.5, dpi = 300)
+
+## ========== 8. 自動 OCP/OC 標註 + DEG + 火山圖 ==========
+# 模組分數 + 分位數門檻：上 65% 判 OCP，下 35% 判 OC，其他為 Other
+obj <- AddModuleScore(
+  object   = obj,
+  features = list(OCP_pos, OC_pos),
+  name     = c("OCPscore","OCscore")
+)
+ocp_col <- grep("^OCPscore", colnames(obj@meta.data), value = TRUE)[1]
+oc_col  <- grep("^OCscore",  colnames(obj@meta.data), value = TRUE)[1]
+
+delta <- obj@meta.data[[ocp_col]] - obj@meta.data[[oc_col]]
+qhi   <- as.numeric(quantile(delta, 0.65, na.rm = TRUE))
+qlo   <- as.numeric(quantile(delta, 0.35, na.rm = TRUE))
+label <- ifelse(delta >= qhi, "OCP", ifelse(delta <= qlo, "OC", "Other"))
+obj$short_cluster <- factor(label, levels = c("OCP","OC","Other"))
+Idents(obj) <- "short_cluster"
+
+n_OCP <- sum(Idents(obj) == "OCP")
+n_OC  <- sum(Idents(obj) == "OC")
+logi(sprintf("Auto labels → OCP=%d, OC=%d, Other=%d", n_OCP, n_OC, sum(Idents(obj)=="Other")))
+write.csv(table(obj$short_cluster), file.path(out_dir, "auto_labels_counts.csv"))
+
+# DEG：OCP vs OC（Wilcoxon）
+deg_path <- file.path(out_dir, "DE_OCP_vs_OC.csv")
+if (n_OCP >= 100 && n_OC >= 100) {
+  logi("FindMarkers OCP vs OC (wilcox)…")
+  de <- FindMarkers(
+    object = obj,
+    ident.1 = "OCP",
+    ident.2 = "OC",
+    test.use = "wilcox",
+    logfc.threshold = 0,      # 先不過濾，交給火山圖門檻
+    min.pct = 0.1
+  )
+  de <- de[order(de$p_val_adj, -abs(de$avg_log2FC)), , drop = FALSE]
+  write.csv(de, deg_path)
+  logi("✓ DEG written: ", deg_path)
+
+  # 火山圖
+  vol <- transform(
+    de,
+    gene = rownames(de),
+    neglog10padj = -log10(pmax(p_val_adj, .Machine$double.eps)),
+    sig = (p_val_adj < 0.05) & (abs(avg_log2FC) > 0.25)
+  )
+  up_lab <- vol[vol$avg_log2FC > 0 & vol$sig, ]
+  dn_lab <- vol[vol$avg_log2FC < 0 & vol$sig, ]
+  up_lab <- head(up_lab[order(-up_lab$avg_log2FC, up_lab$p_val_adj), ], 10)
+  dn_lab <- head(dn_lab[order(dn_lab$avg_log2FC,  dn_lab$p_val_adj), ], 10)
+  lab_genes <- unique(c(up_lab$gene, dn_lab$gene))
+
+  p_vol <- ggplot(vol, aes(x = avg_log2FC, y = neglog10padj)) +
+    geom_point(aes(alpha = sig), size = 1.2) +
+    scale_alpha_manual(values = c(`TRUE` = 0.9, `FALSE` = 0.4)) +
+    geom_vline(xintercept = c(-0.25, 0.25), linetype = 2, linewidth = 0.3) +
+    geom_hline(yintercept = -log10(0.05),    linetype = 2, linewidth = 0.3) +
+    ggrepel::geom_text_repel(
+      data = subset(vol, gene %in% lab_genes),
+      aes(label = gene),
+      size = 3, max.overlaps = 30, box.padding = 0.4
+    ) +
+    labs(x = "avg_log2FC (OCP vs OC)", y = "-log10(adjusted p-value)",
+         title = "DEG Volcano: OCP vs OC") +
+    theme_minimal(base_size = 12)
+
+  vol_path <- file.path(plot_dir, "DE_volcano_OCP_vs_OC.png")
+  ggsave(vol_path, p_vol, width = 8.5, height = 6.0, dpi = 300)
+  logi("✓ Volcano plot: ", vol_path)
+
+  # （可選）GO 富集：只在 DO_ENRICH=1 且有顯著上調基因時執行
+  if (DO_ENRICH) {
+    up_genes <- vol$gene[vol$sig & vol$avg_log2FC > 0]
+    if (length(up_genes)) {
+      if (!requireNamespace("BiocManager", quietly = TRUE))
+        install.packages("BiocManager", repos = "https://cloud.r-project.org")
+      BiocManager::install(c("clusterProfiler","org.Hs.eg.db","AnnotationDbi"),
+                           update = FALSE, ask = FALSE)
+      suppressPackageStartupMessages({
+        library(clusterProfiler); library(org.Hs.eg.db); library(AnnotationDbi)
+      })
+      entrez <- AnnotationDbi::mapIds(org.Hs.eg.db, up_genes, "ENTREZID", "SYMBOL", multiVals = "first")
+      entrez <- na.omit(unname(entrez))
+      if (length(entrez)) {
+        ego <- clusterProfiler::enrichGO(entrez, OrgDb = org.Hs.eg.db, keyType = "ENTREZID", ont = "BP")
+        write.csv(as.data.frame(ego), file.path(out_dir, "GO_up_OCP.csv"), row.names = FALSE)
+        logi("✓ GO enrichment saved: ", file.path(out_dir, "GO_up_OCP.csv"))
+      } else {
+        logi("No ENTREZ IDs mapped; skip GO.")
+      }
+    } else {
+      logi("No significant up genes for enrichment; skip GO.")
+    }
+  }
+} else {
+  logi("⚠ OCP/OC too few for DEG (need ≥100 each by default). Skipped DEG/Volcano.")
+}
+
+## ========== 9. 技術下采樣 ARI ==========
 logi("Technical half-subsampling (5x) for ARI…")
-quiet_install("clue"); suppressPackageStartupMessages(library(clue))
 ari_vec <- replicate(5, {
   cells_half <- sample(colnames(obj), floor(0.5 * ncol(obj)))
   obj_half <- subset(obj, cells = cells_half) |>
@@ -206,7 +328,7 @@ ari_vec <- replicate(5, {
 })
 write.csv(data.frame(ARI = ari_vec), file.path(out_dir, "tech_subsample_ARI.csv"), row.names = FALSE)
 
-## ========== 9. (可選) LODO ==========
+## ========== 10.（可選）Leave-One-Donor-Out ==========
 if ("donor" %in% colnames(obj@meta.data)) {
   logi("LODO across donors…")
   donors <- unique(obj$donor)
@@ -225,50 +347,18 @@ if ("donor" %in% colnames(obj@meta.data)) {
             file.path(out_dir, "LODO_accuracy.csv"), row.names = FALSE)
 }
 
-## ========== 10. (可選) 差異表達與 GO 富集 ==========
-# 假設你會在外部（或上一步）把 OCP/OC label 寫到 meta 欄位 short_cluster
-if ("short_cluster" %in% colnames(obj@meta.data)) {
-  Idents(obj) <- "short_cluster"
-  if (all(c("OCP","OC") %in% levels(Idents(obj)))) {
-    logi("FindMarkers OCP vs OC (wilcox)…")
-    de <- FindMarkers(obj, ident.1 = "OCP", ident.2 = "OC", test.use = "wilcox")
-    write.csv(de, file.path(out_dir, "DE_OCP_vs_OC.csv"))
-    # 可選 GO 富集：只在 DO_ENRICH=1 且有顯著基因時執行
-    if (DO_ENRICH && nrow(de) > 0) {
-      up <- rownames(de)[de$avg_log2FC > 0.25 & de$p_val_adj < 0.05]
-      if (length(up)) {
-        if (!requireNamespace("BiocManager", quietly = TRUE))
-          install.packages("BiocManager", repos = "https://cloud.r-project.org")
-        BiocManager::install(c("clusterProfiler","org.Hs.eg.db","AnnotationDbi"),
-                             update = FALSE, ask = FALSE)
-        suppressPackageStartupMessages({
-          library(clusterProfiler); library(org.Hs.eg.db); library(AnnotationDbi)
-        })
-        entrez <- AnnotationDbi::mapIds(org.Hs.eg.db, up, "ENTREZID", "SYMBOL", multiVals = "first")
-        entrez <- na.omit(unname(entrez))
-        if (length(entrez)) {
-          ego <- clusterProfiler::enrichGO(entrez, OrgDb = org.Hs.eg.db, keyType = "ENTREZID", ont = "BP")
-          write.csv(as.data.frame(ego), file.path(out_dir, "GO_up_OCP.csv"), row.names = FALSE)
-        }
-      }
-    }
-  } else {
-    logi("short_cluster exists but lacks both OCP & OC levels; skip DE/GO.")
-  }
-} else {
-  logi("No 'short_cluster' in metadata; skip DE/GO.")
-}
-
-## ========== 11. 摘要、保存與 session ==========
+## ========== 11. 摘要、保存 ==========
 summary <- list(
-  n_matrices   = length(mat_files),
-  cells_before = n0,
-  cells_after  = ncol(obj),
-  n_genes      = nrow(obj),
-  n_clusters   = length(levels(Idents(obj))),
-  ari_mean     = if (exists("ari_vec")) mean(ari_vec) else NA_real_,
-  quick_mode   = QUICK,
-  used_glmGamPoi = !is.null(method_sel)
+  n_matrices     = length(mat_files),
+  cells_before   = n0,
+  cells_after    = ncol(obj),
+  n_genes        = nrow(obj),
+  n_clusters     = length(levels(Idents(obj))),
+  ari_mean       = if (exists("ari_vec")) mean(ari_vec) else NA_real_,
+  quick_mode     = QUICK,
+  used_glmGamPoi = !is.null(method_sel),
+  n_OCP          = if (exists("n_OCP")) n_OCP else NA_integer_,
+  n_OC           = if (exists("n_OC"))  n_OC  else NA_integer_
 )
 write_json(summary, file.path(out_dir, "_summary.json"), auto_unbox = TRUE, pretty = TRUE)
 
