@@ -93,6 +93,24 @@ n0 <- ncol(obj)
 obj <- subset(obj, subset = nFeature_RNA > 500 & percent.mt < 20)
 logi("QC filter: cells kept ", ncol(obj), "/", n0)
 
+## ==========newly add=============
+# 多核（Actions 大多 2 核）
+if (!requireNamespace("future", quietly = TRUE)) install.packages("future", repos="https://cloud.r-project.org")
+library(future); plan(multisession, workers = 2)
+
+# QUICK 模式：抽樣少量細胞做快速驗證
+QUICK <- identical(Sys.getenv("QUICK","0"), "1")
+if (QUICK) {
+  set.seed(42)
+  keep <- min(5000, ncol(obj))  # 或 3000 視你資料大小
+  obj <- subset(obj, cells = sample(colnames(obj), keep))
+}
+
+# SCTransform 改用 glmGamPoi（更快、省記憶體）
+obj <- SCTransform(obj, vst.flavor = "v2", method = "glmGamPoi",
+                   conserve.memory = TRUE, verbose = FALSE)
+
+                                                     
 ## ========== 4. normalize + reduce ==========
 logi("SCTransform…")
 obj <- SCTransform(obj, vst.flavor = "v2", verbose = FALSE)
