@@ -15,14 +15,15 @@ on:
 permissions:
   contents: read
 
+# 並發：每個 commit（SHA）獨立群組，不互相取消
 concurrency:
-  group: scrna-${{ github.ref }}
-  cancel-in-progress: true
+  group: scrna-${{ github.ref }}-${{ github.sha }}
+  cancel-in-progress: false
 
 jobs:
   run-pipeline:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 240   # 視需要可再調整
 
     steps:
       - name: Checkout (with Git LFS)
@@ -47,8 +48,8 @@ jobs:
       - name: Cache R packages
         uses: r-lib/actions/setup-r-dependencies@v2
         with:
-          cache-version: 1
-          # 不強制預裝所有相依；腳本會自動安裝缺的
+          cache-version: 2
+          # 腳本會自動安裝缺的；這裡先快取常用基礎包以加速
           extra-packages: |
             any::optparse
             any::Seurat
@@ -66,18 +67,18 @@ jobs:
         env:
           DATA_DIR: .
           OUTPUT_DIR: docs
-          QUICK: "1"               # 1=先快跑確認，通過再全量；0=直接全量
+          QUICK: "1"               # 1=先快跑確認；通過再跑全量
           MIN_OCP: "100"
           MIN_OC: "100"
-          STRICT_FAIL: "0"         # 0=記 error.txt 但不中斷；1=遇錯即失敗
-          DO_DOUBLET: "1"          # 開啟雙元細胞檢測（scDblFinder/MAD）
-          DO_HARMONY: "0"          # 1=用 Harmony（需 BATCH_KEY）
-          DO_ANCHOR: "0"           # 1=用 Seurat anchors（需 BATCH_KEY）
-          BATCH_KEY: "donor"       # 依你的 meta 欄位改成 donor/sample/batch
+          STRICT_FAIL: "0"         # 0=寫 _error.txt 不中斷；1=遇錯中止
+          DO_DOUBLET: "1"          # 啟用雙元細胞檢測（scDblFinder/MAD）
+          DO_HARMONY: "0"          # 1=Harmony（需 BATCH_KEY）
+          DO_ANCHOR: "0"           # 1=Seurat anchors（需 BATCH_KEY）
+          BATCH_KEY: "donor"       # 依你的 meta 欄位改：donor/sample/batch…
           DO_PSEUDOBULK: "1"       # 有 donor 時做 pseudobulk DE
           PSEUDO_MIN_CELLS: "50"
           DO_ENRICH: "0"           # 全量完成後是否做 GO 富集
-          DO_TRAJECTORY: "0"       # 是否做 Slingshot（較花時間）
+          DO_TRAJECTORY: "0"       # 是否跑 Slingshot（較耗時）
         run: |
           Rscript scRNA_OCP_full_pipeline.R --data_dir . --out_dir docs
 
