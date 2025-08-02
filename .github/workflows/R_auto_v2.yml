@@ -4,7 +4,8 @@ on:
 
 jobs:
   run:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04   # ★ 用 22.04 才能吃到 R 的二進位套件，避免漫長編譯
+
     steps:
       - name: Checkout (with LFS)
         uses: actions/checkout@v4
@@ -13,23 +14,37 @@ jobs:
 
       - name: Show repo tree & check data (debug)
         run: |
-          echo "PWD:"; pwd
-          echo "List top-level:"; ls -lah
-          echo "Search *_matrix*.mtx.gz under repo root:"
-          find . -type f -name "*_matrix*.mtx.gz" -printf "%p\t%s bytes\n" | head -n 50 || true
+          echo "Top-level files:"; ls -lah
+          echo "Search *_matrix*.mtx.gz:"; find . -type f -name "*_matrix*.mtx.gz" -printf "%p\t%s bytes\n" | head -n 50 || true
 
-      - uses: r-lib/actions/setup-r@v2
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          use-public-rspm: true     # ★ 用 RSPM 拉 Linux 二進位，搭配 22.04 才有效
 
-      - name: Install system libs
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y libcurl4-openssl-dev libssl-dev libxml2-dev
+      - name: Restore R deps (binary + cache)
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          extra-packages: |
+            any::Seurat
+            any::SeuratObject
+            any::patchwork
+            any::readr
+            any::dplyr
+            any::ggplot2
+            any::matrixStats
+            any::optparse
+            any::future
+            bioc::clusterProfiler
+            bioc::org.Hs.eg.db
+            bioc::glmGamPoi
 
-      - name: Run R script (capture log)
+      - name: Run R script (QUICK mode)
         env:
-          DATA_DIR: .       # ★ 你說資料放在主目錄，這裡改成「.」
+          DATA_DIR: .         # 你說資料在倉庫根目錄
           OUTPUT_DIR: docs
-          STRICT_FAIL: "0"  # ★ 關閉嚴格模式（警告但不 exit 1）
+          QUICK: "1"          # ★ 快速模式（抽樣）先驗證流程，之後要全量就移除這行
+          STRICT_FAIL: "0"    # 先別因門檻而失敗，拿到成果與 log 再說
         run: |
           mkdir -p docs
           Rscript scRNA_OCP_full_pipeline.R \
@@ -38,19 +53,14 @@ jobs:
 
       - name: Print summary if present
         run: |
-          if [ -f docs/_summary.json ]; then
-            echo "===== SUMMARY ====="
-            cat docs/_summary.json
-          else
-            echo "No summary file."
-          fi
+          test -f docs/_summary.json && (echo "===== SUMMARY ====="; cat docs/_summary.json) || echo "No summary."
 
-      # 即使失敗也把 docs/ 打包，讓你下載 run.log / 圖片 / CSV
       - name: Upload artifacts (always)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: scRNA_results
           path: docs
+
 
 
